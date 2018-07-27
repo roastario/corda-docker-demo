@@ -1,0 +1,3 @@
+FROM roastario/notary-and-network-map:latest
+COPY nodeInfos /opt/notaries
+

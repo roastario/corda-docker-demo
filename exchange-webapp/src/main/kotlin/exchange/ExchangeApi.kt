@@ -1,0 +1,17 @@
+package exchange
+
+import org.springframework.beans.factory.annotation.Autowired
+import org.springframework.web.bind.annotation.RequestMapping
+import org.springframework.web.bind.annotation.RequestMethod
+import org.springframework.web.bind.annotation.RestController
+import rpc.NodeRPCConnection
+
+@RestController
+class ExchangeApi(@Autowired val rpc: NodeRPCConnection) {
+
+    @RequestMapping(path = ["whoami"], method = [RequestMethod.GET])
+    fun whoami() {
+        println(rpc.proxy.nodeInfo().legalIdentities.first().name.toString())
+    }
+
+}

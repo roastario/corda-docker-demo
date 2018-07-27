@@ -1,0 +1,260 @@
+import com.github.dockerjava.api.DockerClient
+import com.github.dockerjava.api.async.ResultCallback
+import com.github.dockerjava.api.command.DockerCmdExecFactory
+import com.github.dockerjava.api.model.PushResponseItem
+import com.github.dockerjava.core.DefaultDockerClientConfig
+import com.github.dockerjava.core.DockerClientBuilder
+import com.github.dockerjava.core.command.BuildImageResultCallback
+import com.github.dockerjava.jaxrs.JerseyDockerCmdExecFactory
+
+import java.util.concurrent.CompletableFuture
+import java.util.stream.Collectors
+import java.util.stream.IntStream
+
+buildscript {
+    ext.kotlin_version = '1.2.50'
+
+    repositories {
+        jcenter()
+        mavenCentral()
+        maven { url 'https://dl.bintray.com/kotlin/exposed' }
+        maven { url 'https://jitpack.io' }
+        mavenLocal()
+    }
+    dependencies {
+        classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlin_version"
+        classpath 'com.aries:docker-java-shaded:3.0.14'
+        classpath group: 'com.opencsv', name: 'opencsv', version: '4.2'
+    }
+}
+
+group 'com.r3'
+version '1.0-SNAPSHOT'
+
+apply plugin: 'java'
+apply plugin: 'kotlin'
+
+sourceCompatibility = 1.8
+
+repositories {
+    mavenCentral()
+    mavenLocal()
+    jcenter()
+}
+
+configurations {
+    notaryRuntime
+    notaryRuntime.transitive = false
+}
+
+dependencies {
+    compile "org.jetbrains.kotlin:kotlin-stdlib-jdk8:$kotlin_version"
+    compile "com.aries:docker-java-shaded:3.0.14"
+    notaryRuntime group: corda_release_group, name: 'corda', version: corda_release_version
+
+    testCompile group: 'junit', name: 'junit', version: '4.12'
+}
+
+compileKotlin {
+    kotlinOptions.jvmTarget = "1.8"
+}
+compileTestKotlin {
+    kotlinOptions.jvmTarget = "1.8"
+}
+
+task copyCordaJar() {
+    doLast {
+        def cordaJarName = file(project.configurations.notaryRuntime.first()).name
+        def notariesBuildFolder = new File(project.buildDir, "notaryBase")
+        project.copy {
+            from project.configurations.notaryRuntime.first()
+            into notariesBuildFolder
+            rename(cordaJarName, "corda.jar")
+        }
+    }
+}
+
+static def buildLegalNameString(legalName) {
+    return "myLegalName=\"${legalName}\""
+}
+
+//noinspection GroovyAssignabilityCheck
+task buildNotariesAndNetworkMap(dependsOn: [copyCordaJar, jar]) {
+
+    DockerClient clientToUse = getDockerClient()
+
+    final String TAG = (System.env.TAG == null) ? "latest" : System.env.TAG
+    final String DOCKER_REPOSITORY = (System.env.DOCKER_REPO == null) ? "roastario" : System.env.DOCKER_REPO
+    final int NUMBER_OF_NOTARIES = (System.env.NUMBER_OF_NOTARIES == null) ? 2 : Integer.parseInt(System.env.NUMBER_OF_NOTARIES)
+
+    doLast {
+        List<CompletableFuture<Triplet<String, String, File>>> futures = IntStream.range(0, NUMBER_OF_NOTARIES).mapToObj { idx ->
+            CompletableFuture.supplyAsync {
+                def dirForThisNotary = File.createTempDir()
+                project.copy {
+                    into dirForThisNotary
+                    from "generate_identity_node.conf"
+                    rename("generate_identity_node.conf", "node.conf")
+                }
+                def pb = new ProcessBuilder("java", "-jar", new File(new File(project.buildDir, "notaryBase"), "corda.jar").absolutePath, "--just-generate-node-info")
+                def env = pb.environment()
+                def notaryName = "O=Notary ${idx},L=London,C=GB"
+                env.put("NOTARY_LEGAL_NAME", notaryName)
+
+                println "building notary with X500: ${notaryName}"
+
+                pb.directory(dirForThisNotary)
+                        .inheritIO()
+                        .start().waitFor()
+
+                println "finished building notary with X500: ${notaryName}"
+                return new Triplet<String, File, Integer>(notaryName, dirForThisNotary, idx)
+            }
+        }.map { finishedNotaryInfoGen ->
+            return finishedNotaryInfoGen.thenApply { result ->
+                def name = result.a
+                def directory = result.b
+                def idx = result.c
+
+                List<String> linesToWrite = {
+                    def list = new File(project.projectDir, "node.conf").withReader { it.readLines() }
+                    list.add(buildLegalNameString(name))
+                    return list
+                }.call()
+
+                new File(directory, "node.conf").withPrintWriter { writer ->
+                    linesToWrite.forEach {
+                        writer.println(it)
+                    }
+                }
+                project.copy {
+                    from new File(new File(project.buildDir, "notaryBase"), "corda.jar").absolutePath
+                    from new File(project.projectDir, "src/Notary_Dockerfile")
+                    into directory.absolutePath
+                    rename("Notary_Dockerfile", "Dockerfile")
+                }
+
+                String imageId = clientToUse.buildImageCmd()
+                        .withBaseDirectory(directory)
+                        .withDockerfile(new File(directory, "Dockerfile"))
+                        .exec(new BuildImageResultCallback()).awaitImageId()
+
+                clientToUse.tagImageCmd(imageId, "${DOCKER_REPOSITORY}/notary${idx + 1}-out-of-$NUMBER_OF_NOTARIES", TAG).withForce().exec()
+                return new Triplet<String, String, File>(name, "${DOCKER_REPOSITORY}/notary${idx + 1}-out-of-$NUMBER_OF_NOTARIES:${TAG}", directory)
+            }
+        }.collect()
+        CompletableFuture.allOf(*futures).thenAccept {
+            List<Triplet<String, String, File>> notaryBuildResults = futures.stream().map {
+                it.get()
+            }.collect(Collectors.toList())
+
+            def nodeInfos = notaryBuildResults.stream().map { it.c as File }.map {
+                it.listFiles().find { it.name.startsWith("nodeInfo") }
+            }.collect(Collectors.toList())
+
+            def dirToBuildNetworkMap = File.createTempDir()
+            def nodeInfoDir = new File(dirToBuildNetworkMap, "nodeInfos")
+            nodeInfoDir.mkdirs()
+            println("Building network map in: ${dirToBuildNetworkMap.absolutePath}")
+
+
+
+            project.copy {
+                from new File(project.projectDir, "src/NetworkMap_Dockerfile")
+                into dirToBuildNetworkMap
+            }
+
+            nodeInfos.forEach { nodeInfoFile ->
+                project.copy {
+                    from nodeInfoFile.absolutePath
+                    into nodeInfoDir.absolutePath
+                }
+            }
+            String imageId = clientToUse.buildImageCmd()
+                    .withBaseDirectory(dirToBuildNetworkMap)
+                    .withDockerfile(new File(dirToBuildNetworkMap, "NetworkMap_Dockerfile"))
+                    .exec(new BuildImageResultCallback()).awaitImageId()
+            clientToUse.tagImageCmd(imageId, "${DOCKER_REPOSITORY}/network-map-with-$NUMBER_OF_NOTARIES-notaries", TAG).withForce().exec()
+
+
+            pushToRepo("${DOCKER_REPOSITORY}/network-map-with-$NUMBER_OF_NOTARIES-notaries:$TAG", clientToUse).join()
+            notaryBuildResults.forEach {
+                pushToRepo(it.b, clientToUse).join()
+            }
+        }.join()
+    }
+}
+
+
+private DockerClient getDockerClient() {
+    def config = DefaultDockerClientConfig.createDefaultConfigBuilder()
+    DockerCmdExecFactory dockerCmdExecFactory = new JerseyDockerCmdExecFactory()
+            .withReadTimeout(1000)
+            .withConnectTimeout(1000)
+            .withMaxTotalConnections(100)
+            .withMaxPerRouteConnections(10);
+
+    DockerClient dockerClient = DockerClientBuilder.getInstance(config)
+            .build();
+    return dockerClient
+}
+
+
+private CompletableFuture<String> pushToRepo(String taggedImage, DockerClient client) {
+    CompletableFuture<String> future = new CompletableFuture<String>()
+    client.pushImageCmd(taggedImage)
+            .exec(new ResultCallback<PushResponseItem>() {
+        @Override
+        void onStart(Closeable closeable) {
+            println("Comencing push for: $taggedImage")
+        }
+
+        @Override
+        void onNext(PushResponseItem pushResponseItem) {
+            if (pushResponseItem.errorIndicated) {
+                future.completeExceptionally(new RuntimeException("Failed to push: $taggedImage due to ${pushResponseItem.errorDetail.message}"))
+            }
+        }
+
+        @Override
+        void onError(Throwable throwable) {
+            future.completeExceptionally(throwable)
+        }
+
+        @Override
+        void onComplete() {
+            println("finished push for: $taggedImage")
+            future.complete(taggedImage)
+        }
+
+        @Override
+        void close() throws IOException {
+        }
+    })
+
+    return future
+
+}
+
+class Triplet<A, B, C> {
+    public final A a;
+    public final B b;
+    public final C c;
+
+    Triplet(A a, B b, C c) {
+        this.a = a
+        this.b = b
+        this.c = c
+    }
+
+
+    @Override
+    public String toString() {
+        return "Triplet{" +
+                "a=" + a +
+                ", b=" + b +
+                ", c=" + c +
+                '}';
+    }
+}
+

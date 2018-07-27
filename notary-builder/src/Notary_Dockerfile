@@ -1,0 +1,12 @@
+FROM openjdk:8-jdk-alpine
+
+RUN apk --no-cache --update add bash
+RUN apk add curl
+RUN mkdir -p /opt/corda
+COPY node.conf /opt/corda/node.conf
+COPY certificates /opt/corda/certificates
+COPY corda.jar /opt/corda/corda.jar
+
+EXPOSE 10200
+WORKDIR /opt/corda
+CMD "java -Djava.security.egd=file:/dev/./urandom -jar corda.jar"

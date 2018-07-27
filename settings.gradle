@@ -1,0 +1,12 @@
+rootProject.name = 'corda-docker-demo'
+include 'trader-webapp'
+include 'exchange-webapp'
+include 'webapp-commons'
+include 'clearinghouse-webapp'
+include 'exchange-cordapp'
+include 'clearinghouse-cordapp'
+include 'trader-cordapp'
+include 'clearinghouse-trader-cordapp'
+include 'notary-builder'
+include 'network-builder'
+
